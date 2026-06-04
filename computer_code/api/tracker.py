@@ -55,7 +55,18 @@ class ThreadedCamera:
         self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
 
+        # Diagnose silent open failures (DirectShow gives no exception).
+        if not self.cap.isOpened():
+            print(f"[tracker] WARNING: camera index {src} failed to open (cv.CAP_DSHOW)")
+        else:
+            actual_w = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+            print(f"[tracker] camera {src} opened @ {actual_w}x{actual_h}")
+
         self.ret, self.frame = self.cap.read()
+        if not self.ret or self.frame is None:
+            print(f"[tracker] WARNING: camera {src} first read failed (cap.read returned {self.ret})")
+
         self.running = True
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._update, daemon=True)
@@ -269,6 +280,7 @@ class Tracker:
     def start(self):
         if self._running:
             return
+        print(f"[tracker] opening cameras at indices {self.camera_indices}")
         self._cameras = [
             ThreadedCamera(idx, self.cam_width, self.cam_height)
             for idx in self.camera_indices
@@ -277,6 +289,7 @@ class Tracker:
         self._running = True
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
+        print("[tracker] worker thread started")
 
     def stop(self):
         self._running = False
@@ -359,10 +372,15 @@ class Tracker:
         half_h = self.cam_height // 2
 
         self._last_tick = time.perf_counter()
+        last_hb_t = time.perf_counter()
+        fix_count = 0
+        detect_count = [0] * len(self._cameras)
+        loop_count = 0
 
         while self._running:
             frames = []
             detected = {}
+            loop_count += 1
 
             for i, cam in enumerate(self._cameras):
                 ok, frame = cam.read()
@@ -378,6 +396,7 @@ class Tracker:
                 )
                 if point is not None:
                     detected[i] = point
+                    detect_count[i] += 1
 
                 _annotate(frame, DEFAULT_CAMERA_NAMES[i], point, self.threshold)
                 frames.append(frame)
@@ -390,6 +409,7 @@ class Tracker:
                     pt_cam1, self.world_scale, self.world_R, self.world_t
                 )
                 xyz_m = pt_world_mm / 1000.0  # mm -> m
+                fix_count += 1
 
             # Build grid + JPEG
             grid = _make_grid(frames, half_w, half_h)
@@ -408,6 +428,23 @@ class Tracker:
                 self._latest_jpeg = jpeg_bytes
                 if xyz_m is not None:
                     self._latest_fix_id += 1
+
+            # Once per second, print what each camera is seeing + last world xyz
+            if now - last_hb_t > 1.0:
+                hb_age = now - last_hb_t
+                last_hb_t = now
+                cams_str = " ".join(
+                    f"c{i}:{detect_count[i]}" for i in range(len(self._cameras))
+                )
+                xyz_str = (
+                    f"pos=({xyz_m[0]:+.3f},{xyz_m[1]:+.3f},{xyz_m[2]:+.3f})m"
+                    if xyz_m is not None else "pos=<no fix>"
+                )
+                print(f"[tracker] {loop_count/hb_age:.0f}Hz loops/s  "
+                      f"detect/s {cams_str}  fixes/s={fix_count/hb_age:.0f}  {xyz_str}")
+                detect_count = [0] * len(self._cameras)
+                fix_count = 0
+                loop_count = 0
 
 
 # =========================

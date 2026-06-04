@@ -55,7 +55,11 @@ HEADING_LPF_FS = 50.0       # the drone ESP-NOWs heading at 50 Hz
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Force threading mode so socketio.emit() from our plain threading.Thread
+# workers (control / heading / emitter) actually reaches connected clients.
+# Without this, Flask-SocketIO will pick eventlet if it's installed and emits
+# from non-green threads silently never get delivered.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 cameras = Cameras.instance()
 kf = KalmanFilter()
@@ -211,11 +215,21 @@ def _control_loop():
 
 def _emitter_loop():
     period = 1.0 / EMIT_HZ
+    emit_count = 0
+    last_hb = time.perf_counter()
     while True:
         time.sleep(period)
         with _state_lock:
             payload = dict(_emit_state)
         socketio.emit("drone-state", payload)
+        emit_count += 1
+        now = time.perf_counter()
+        if now - last_hb > 2.0:
+            pos = payload.get("pos")
+            print(f"[emitter] {emit_count / (now - last_hb):.0f} emits/s, "
+                  f"last pos={pos}")
+            emit_count = 0
+            last_hb = now
 
 
 # =========================
