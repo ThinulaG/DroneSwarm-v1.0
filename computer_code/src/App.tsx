@@ -167,7 +167,7 @@ export default function App() {
                   {cameraStreamRunning ? "Stop" : "Start"}
                 </Button>
                 <Form.Range
-                  min={50} max={250} value={threshold}
+                  min={0} max={250} value={threshold}
                   style={{ width: 160, display: "inline-block", verticalAlign: "middle" }}
                   onChange={(e) => setThreshold(parseInt(e.target.value, 10))}
                 />
