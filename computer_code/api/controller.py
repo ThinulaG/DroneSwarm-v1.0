@@ -95,7 +95,7 @@ class ControlParams:
 
     # State-machine timings
     arming_hold_s: float = 0.3
-    takeoff_ramp_s: float = 2.0
+    takeoff_ramp_s: float = 5.0
     landing_ramp_s: float = 1.5
 
     # Safety
