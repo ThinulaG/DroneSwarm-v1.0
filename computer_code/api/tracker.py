@@ -50,31 +50,72 @@ DEFAULT_MAX_BLOB_AREA = 5000
 class ThreadedCamera:
     def __init__(self, src, width, height):
         self.src = src
-        self.cap = cv.VideoCapture(src, cv.CAP_DSHOW)
-        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
-
-        # Diagnose silent open failures (DirectShow gives no exception).
-        if not self.cap.isOpened():
-            print(f"[tracker] WARNING: camera index {src} failed to open (cv.CAP_DSHOW)")
-        else:
-            actual_w = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
-            print(f"[tracker] camera {src} opened @ {actual_w}x{actual_h}")
-
-        self.ret, self.frame = self.cap.read()
-        if not self.ret or self.frame is None:
-            print(f"[tracker] WARNING: camera {src} first read failed (cap.read returned {self.ret})")
-
+        self.width = width
+        self.height = height
+        self.cap = None
+        self.ret = False
+        self.frame = None
         self.running = True
         self.lock = threading.Lock()
+        self.fail_count = 0
+
+        self._open_camera()
+
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
 
+    def _open_camera(self):
+        if self.cap is not None:
+            self.cap.release()
+            time.sleep(0.5)
+
+        print(f"[tracker] opening camera {self.src}")
+        self.cap = cv.VideoCapture(self.src, cv.CAP_DSHOW)
+
+        self.cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv.CAP_PROP_FPS, 15)
+        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+
+        if not self.cap.isOpened():
+            print(f"[tracker] WARNING: camera {self.src} failed to open")
+            return False
+
+        time.sleep(0.5)
+        ret, frame = self.cap.read()
+
+        with self.lock:
+            self.ret = ret
+            self.frame = frame if ret else None
+
+        print(f"[tracker] camera {self.src} reopen status: {ret}")
+        return ret
+
     def _update(self):
         while self.running:
+            if self.cap is None or not self.cap.isOpened():
+                print(f"[tracker] camera {self.src} is not opened, reopening...")
+                self._open_camera()
+                time.sleep(1)
+                continue
+
             ret, frame = self.cap.read()
+
+            if not ret or frame is None:
+                self.fail_count += 1
+                print(f"[tracker] camera {self.src} lost frame {self.fail_count}")
+
+                if self.fail_count >= 30:
+                    print(f"[tracker] reopening camera {self.src}")
+                    self._open_camera()
+                    self.fail_count = 0
+
+                time.sleep(0.05)
+                continue
+
+            self.fail_count = 0
+
             with self.lock:
                 self.ret = ret
                 self.frame = frame
@@ -88,9 +129,8 @@ class ThreadedCamera:
     def stop(self):
         self.running = False
         self.thread.join(timeout=1.0)
-        self.cap.release()
-
-
+        if self.cap is not None:
+            self.cap.release()
 # =========================
 # Calibration loaders
 # =========================
@@ -281,10 +321,11 @@ class Tracker:
         if self._running:
             return
         print(f"[tracker] opening cameras at indices {self.camera_indices}")
-        self._cameras = [
-            ThreadedCamera(idx, self.cam_width, self.cam_height)
-            for idx in self.camera_indices
-        ]
+        self._cameras = []
+
+        for idx in self.camera_indices:
+            self._cameras.append(ThreadedCamera(idx, self.cam_width, self.cam_height))
+            time.sleep(1)
         time.sleep(0.5)  # let cameras warm up
         self._running = True
         self._worker = threading.Thread(target=self._loop, daemon=True)
