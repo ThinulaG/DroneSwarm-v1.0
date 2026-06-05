@@ -14,9 +14,10 @@
 
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 
 // ================= USER SETTINGS =================
-uint8_t receiverAddress[] = { 0xC0, 0x4E, 0x30, 0x4B, 0x80, 0x3B };
+uint8_t receiverAddress[] = { 0x10, 0x00, 0x3B, 0xB1, 0x5B, 0x8C };
 #define ESPNOW_CHANNEL 1
 #define SEND_PERIOD_MS 20   // 50 Hz from transmitter to receiver
 #define DEBUG_CMD_PRINT 0
@@ -110,8 +111,11 @@ void setup() {
   WiFi.setChannel(ESPNOW_CHANNEL);
 
   // Print our MAC so the user can paste it into drone_receiver_crsf_espnow.ino
-  Serial.print("[sender] STA MAC: ");
-  Serial.println(WiFi.macAddress());
+  uint8_t staMac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, staMac);
+  Serial.printf("[sender] STA MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                staMac[0], staMac[1], staMac[2],
+                staMac[3], staMac[4], staMac[5]);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");

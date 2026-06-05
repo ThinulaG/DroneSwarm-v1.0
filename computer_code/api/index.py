@@ -185,9 +185,15 @@ def _control_loop():
 
         # ---- Controller ----
         if not kf._initialised:
-            # No measurement ever -> safe sticks, don't run PID
-            T, R, P, Y, A = 1000, 1500, 1500, 1500, 0
+            # Allow bench arming before the tracker has produced its first fix,
+            # but do not permit actual closed-loop flight without a pose.
             ctrl_state = controller.get_state()
+            if ctrl_state in ("TAKEOFF", "HOVER", "LANDING"):
+                T, R, P, Y, A = 1000, 1500, 1500, 1500, 0
+            else:
+                zero = np.zeros(3, dtype=np.float32)
+                T, R, P, Y, A = controller.step(zero, zero, heading, dt)
+                ctrl_state = controller.get_state()
         else:
             T, R, P, Y, A = controller.step(pos, vel, heading, dt)
             ctrl_state = controller.get_state()
@@ -279,6 +285,7 @@ def on_arm(data):
             armed = bool(data["armed"])
         elif "droneArmed" in data and isinstance(data["droneArmed"], list) and data["droneArmed"]:
             armed = bool(data["droneArmed"][0])
+    print(f"[socket] arm-drone -> armed={armed}")
     controller.cmd_arm(armed)
 
 

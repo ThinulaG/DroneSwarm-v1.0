@@ -29,7 +29,7 @@
 
 // Sender ESP32's STA MAC. Replace with the MAC printed at boot by
 // sender_esp32.ino's setup() ("[sender] STA MAC: ...").
-uint8_t senderAddress[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+uint8_t senderAddress[] = { 0x70, 0x4B, 0xCA, 0x48, 0xC1, 0x24 };
 
 HardwareSerial CRSFSerial(1);
 
@@ -182,14 +182,6 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int 
   lastRecvTime = millis();
   applyCommandToChannels(lastCmd);
 
-#if DEBUG_RX_PRINT
-  Serial.print("RX seq="); Serial.print(lastCmd.seq);
-  Serial.print(" arm=");  Serial.print(lastCmd.armed);
-  Serial.print(" T=");    Serial.print(lastCmd.throttle_us);
-  Serial.print(" R=");    Serial.print(lastCmd.roll_us);
-  Serial.print(" P=");    Serial.print(lastCmd.pitch_us);
-  Serial.print(" Y=");    Serial.println(lastCmd.yaw_us);
-#endif
 }
 
 // ---------------- setup / loop ----------------
@@ -204,8 +196,14 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setChannel(ESPNOW_CHANNEL);
 
-  uint8_t newMAC[] = { 0xC0, 0x4E, 0x30, 0x4B, 0x80, 0x3B };
+  uint8_t newMAC[] = { 0x10, 0x00, 0x3B, 0xB1, 0x5B, 0x8C };
   esp_wifi_set_mac(WIFI_IF_STA, newMAC);
+
+  uint8_t staMac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, staMac);
+  Serial.printf("[receiver] STA MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                staMac[0], staMac[1], staMac[2],
+                staMac[3], staMac[4], staMac[5]);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
