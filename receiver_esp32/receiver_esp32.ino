@@ -1,8 +1,11 @@
 // Mocap drone-side ESP32-C3.
-// ESP-NOW <-> CRSF bridge + CRSF telemetry relay back to the laptop.
+// ESP-NOW <-> CRSF bridge + CRSF telemetry relay back to the laptop +
+// nested PID stack (position -> velocity -> stick PWM) running on-board.
 //
-// Inbound (sender -> here):  ControlPacket via ESP-NOW
-//                            -> packed RC channels -> CRSF UART to Betaflight FC.
+// Inbound (sender -> here):  StatePacket via ESP-NOW carrying world-frame
+//                            position/velocity/setpoints and an armed bit.
+//                            PIDs run at 500 Hz, packed RC channels are sent
+//                            over CRSF UART to Betaflight FC at ~250 Hz.
 //                            500 ms failsafe forces safe sticks if comm dies.
 //
 // Outbound (here -> sender):  CRSF telemetry ATTITUDE frames (type 0x1E)
@@ -10,13 +13,15 @@
 //                            forwarded as TelemetryPacket via ESP-NOW @ 50 Hz.
 //                            The laptop ESP32 then prints "H<yaw>" to USB.
 //
-// The CRSF UART (RX pin 20 / TX pin 21) is already bidirectional in your
+// The CRSF UART (RX pin 20 / TX pin 21) is already bidirectional in the
 // wiring -- no new wires needed. Enable CRSF telemetry on this UART in
 // Betaflight's Ports tab.
 
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <PID_v1.h>
+#include <math.h>
 
 // ================= USER SETTINGS =================
 #define CRSF_RX_PIN 20
@@ -25,6 +30,11 @@
 #define FAILSAFE_MS 500
 #define TELEMETRY_PERIOD_MS 20   // 50 Hz drone -> laptop attitude updates
 #define DEBUG_RX_PRINT 0
+
+#define MAX_VEL 100.0
+#define ROTOR_RADIUS 0.0225
+#define Z_GAIN 0.7
+#define ARM_DELAY_MS 100
 // =================================================
 
 // Sender ESP32's STA MAC. Replace with the MAC printed at boot by
@@ -33,16 +43,19 @@ uint8_t senderAddress[] = { 0x70, 0x4B, 0xCA, 0x48, 0xC1, 0x24 };
 
 HardwareSerial CRSFSerial(1);
 
-typedef struct __attribute__((packed)) {
-  uint16_t throttle_us;
-  uint16_t roll_us;
-  uint16_t pitch_us;
-  uint16_t yaw_us;
-  uint8_t  armed;
-  uint32_t seq;
-} ControlPacket;
-
 // MUST match sender_esp32.ino exactly.
+typedef struct __attribute__((packed)) {
+  float    x,  y,  z;
+  float    vx, vy, vz;
+  float    yaw_sp;
+  float    x_sp, y_sp, z_sp;
+  float    pid[17];
+  int16_t  trim_t, trim_r, trim_p, trim_y;
+  uint8_t  armed;
+  uint8_t  msg_type;             // 0=state, 2=pid_gains, 3=trim
+  uint32_t seq;
+} StatePacket;
+
 typedef struct __attribute__((packed)) {
   int16_t  pitch_centirad;
   int16_t  roll_centirad;
@@ -50,11 +63,54 @@ typedef struct __attribute__((packed)) {
   uint32_t seq;
 } TelemetryPacket;
 
-ControlPacket lastCmd;
 TelemetryPacket telem = {0, 0, 0, 0};
 uint32_t lastRecvTime = 0;
 uint32_t lastTelemSend = 0;
+uint32_t lastCRSFSend = 0;
+uint32_t lastLoopTime = 0;
 uint16_t channels[16];
+
+// ---------------- PID state ----------------
+
+bool armed = false;
+unsigned long timeArmed = 0;
+
+int xTrim = 0, yTrim = 0, zTrim = 0, yawTrim = 0;
+
+double groundEffectCoef = 28.0, groundEffectOffset = -0.035;
+
+double xPosSetpoint = 0, xPos = 0;
+double yPosSetpoint = 0, yPos = 0;
+double zPosSetpoint = 0, zPos = 0;
+double yawPosSetpoint = 0, yawPos = 0, yawPosOutput = 0;
+
+double xyPosKp = 1.0,  xyPosKi = 0.0,  xyPosKd = 0.0;
+double zPosKp  = 1.5,  zPosKi  = 0.0,  zPosKd  = 0.0;
+double yawPosKp = 0.3, yawPosKi = 0.1, yawPosKd = 0.05;
+
+double xVelSetpoint = 0, xVel = 0, xVelOutput = 0;
+double yVelSetpoint = 0, yVel = 0, yVelOutput = 0;
+double zVelSetpoint = 0, zVel = 0, zVelOutput = 0;
+
+double xyVelKp = 0.2, xyVelKi = 0.03, xyVelKd = 0.05;
+double zVelKp  = 0.3, zVelKi  = 0.1,  zVelKd  = 0.05;
+
+PID xPosPID(&xPos, &xVelSetpoint, &xPosSetpoint, xyPosKp, xyPosKi, xyPosKd, DIRECT);
+PID yPosPID(&yPos, &yVelSetpoint, &yPosSetpoint, xyPosKp, xyPosKi, xyPosKd, DIRECT);
+PID zPosPID(&zPos, &zVelSetpoint, &zPosSetpoint, zPosKp,  zPosKi,  zPosKd,  DIRECT);
+PID yawPosPID(&yawPos, &yawPosOutput, &yawPosSetpoint, yawPosKp, yawPosKi, yawPosKd, DIRECT);
+
+PID xVelPID(&xVel, &xVelOutput, &xVelSetpoint, xyVelKp, xyVelKi, xyVelKd, DIRECT);
+PID yVelPID(&yVel, &yVelOutput, &yVelSetpoint, xyVelKp, xyVelKi, xyVelKd, DIRECT);
+PID zVelPID(&zVel, &zVelOutput, &zVelSetpoint, zVelKp,  zVelKi,  zVelKd,  DIRECT);
+
+// Forces an integrator reset by walking the output limits across the current value.
+// This is the same trick the original drone-side firmware used at disarm.
+void resetPid(PID &pid, double mn, double mx) {
+  pid.SetOutputLimits(0.0, 1.0);
+  pid.SetOutputLimits(-1.0, 0.0);
+  pid.SetOutputLimits(mn, mx);
+}
 
 // ---------------- CRSF ----------------
 
@@ -69,9 +125,19 @@ uint8_t crc8(const uint8_t *ptr, uint8_t len) {
   return crc;
 }
 
+// Maps a 1000..2000 µs RC range into CRSF's 172..1811 channel range.
+// Kept for the safe-channels path (which still thinks in µs).
 uint16_t usToCRSF(uint16_t us) {
   us = constrain(us, 1000, 2000);
   return map(us, 1000, 2000, 172, 1811);
+}
+
+// PWM values from the PID stack are already in CRSF range (~172..1811 around 992).
+// Just clamp and forward -- no µs round-trip.
+uint16_t pwmToCRSF(int pwm) {
+  if (pwm < 172) pwm = 172;
+  if (pwm > 1811) pwm = 1811;
+  return (uint16_t)pwm;
 }
 
 void setSafeChannels() {
@@ -81,15 +147,6 @@ void setSafeChannels() {
   channels[2] = usToCRSF(1000);
   channels[3] = usToCRSF(1500);
   channels[4] = usToCRSF(1000);
-}
-
-void applyCommandToChannels(const ControlPacket &cmd) {
-  for (int i = 0; i < 16; i++) channels[i] = 992;
-  channels[0] = usToCRSF(cmd.roll_us);
-  channels[1] = usToCRSF(cmd.pitch_us);
-  channels[2] = usToCRSF(cmd.throttle_us);
-  channels[3] = usToCRSF(cmd.yaw_us);
-  channels[4] = cmd.armed ? usToCRSF(2000) : usToCRSF(1000);
 }
 
 void sendCRSF() {
@@ -177,11 +234,42 @@ void parseCRSFByte(uint8_t b) {
 // ---------------- ESP-NOW ----------------
 
 void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
-  if (len != sizeof(ControlPacket)) return;
-  memcpy(&lastCmd, incomingData, sizeof(lastCmd));
+  if (len != sizeof(StatePacket)) return;
+  StatePacket pkt;
+  memcpy(&pkt, incomingData, sizeof(pkt));
   lastRecvTime = millis();
-  applyCommandToChannels(lastCmd);
 
+  if (pkt.msg_type == 0) {
+    xPos = pkt.x;     yPos = pkt.y;     zPos = pkt.z;
+    xVel = pkt.vx;    yVel = pkt.vy;    zVel = pkt.vz;
+    yawPosSetpoint = pkt.yaw_sp;
+    xPosSetpoint = pkt.x_sp;
+    yPosSetpoint = pkt.y_sp;
+    zPosSetpoint = pkt.z_sp;
+
+    bool newArmed = pkt.armed ? true : false;
+    if (newArmed && !armed) {
+      timeArmed = millis();
+    }
+    armed = newArmed;
+
+  } else if (pkt.msg_type == 2) {
+    xPosPID.SetTunings(pkt.pid[0], pkt.pid[1], pkt.pid[2]);
+    yPosPID.SetTunings(pkt.pid[0], pkt.pid[1], pkt.pid[2]);
+    zPosPID.SetTunings(pkt.pid[3], pkt.pid[4], pkt.pid[5]);
+    yawPosPID.SetTunings(pkt.pid[6], pkt.pid[7], pkt.pid[8]);
+    xVelPID.SetTunings(pkt.pid[9], pkt.pid[10], pkt.pid[11]);
+    yVelPID.SetTunings(pkt.pid[9], pkt.pid[10], pkt.pid[11]);
+    zVelPID.SetTunings(pkt.pid[12], pkt.pid[13], pkt.pid[14]);
+    groundEffectCoef   = pkt.pid[15];
+    groundEffectOffset = pkt.pid[16];
+
+  } else if (pkt.msg_type == 3) {
+    xTrim   = pkt.trim_r;
+    yTrim   = pkt.trim_p;
+    zTrim   = pkt.trim_t;
+    yawTrim = pkt.trim_y;
+  }
 }
 
 // ---------------- setup / loop ----------------
@@ -221,29 +309,116 @@ void setup() {
     Serial.println("Failed to add sender peer (check senderAddress[])");
   }
 
-  Serial.println("Receiver ready: ESP-NOW -> CRSF; CRSF telem -> ESP-NOW");
+  // PID configuration -- sample time 0 means "trust the caller's cadence".
+  xPosPID.SetMode(AUTOMATIC);    xPosPID.SetSampleTime(0);
+  yPosPID.SetMode(AUTOMATIC);    yPosPID.SetSampleTime(0);
+  zPosPID.SetMode(AUTOMATIC);    zPosPID.SetSampleTime(0);
+  yawPosPID.SetMode(AUTOMATIC);  yawPosPID.SetSampleTime(0);
+  xVelPID.SetMode(AUTOMATIC);    xVelPID.SetSampleTime(0);
+  yVelPID.SetMode(AUTOMATIC);    yVelPID.SetSampleTime(0);
+  zVelPID.SetMode(AUTOMATIC);    zVelPID.SetSampleTime(0);
+
+  xPosPID.SetOutputLimits(-MAX_VEL, MAX_VEL);
+  yPosPID.SetOutputLimits(-MAX_VEL, MAX_VEL);
+  zPosPID.SetOutputLimits(-MAX_VEL, MAX_VEL);
+  yawPosPID.SetOutputLimits(-1, 1);
+  xVelPID.SetOutputLimits(-1, 1);
+  yVelPID.SetOutputLimits(-1, 1);
+  zVelPID.SetOutputLimits(-1, 1);
+
+  lastRecvTime  = millis();
+  lastTelemSend = millis();
+  lastCRSFSend  = millis();
+  lastLoopTime  = micros();
+
+  Serial.println("Receiver ready: ESP-NOW state -> PID -> CRSF; CRSF telem -> ESP-NOW");
 }
 
 void loop() {
-  // 1) Drain CRSF UART for telemetry frames from FC
+  // 1) Drain CRSF UART for telemetry frames from FC (cheap, every iteration)
   while (CRSFSerial.available()) {
     parseCRSFByte((uint8_t)CRSFSerial.read());
   }
 
-  // 2) Failsafe if PC comm died
-  if (millis() - lastRecvTime > FAILSAFE_MS) {
-    setSafeChannels();
+  // 2) Failsafe if PC comm died -- disarm and force safe sticks.
+  bool failsafe = (millis() - lastRecvTime > FAILSAFE_MS);
+  if (failsafe) {
+    armed = false;
   }
 
-  // 3) Send RC channels packed to FC
-  sendCRSF();
+  // 3) PID loop runs every loop iteration (~500 Hz pacing below).
+  if (!armed) {
+    // Park integrators so we don't pop on rearm.
+    resetPid(xPosPID,   -MAX_VEL, MAX_VEL);
+    resetPid(yPosPID,   -MAX_VEL, MAX_VEL);
+    resetPid(zPosPID,   -MAX_VEL, MAX_VEL);
+    resetPid(yawPosPID, -1, 1);
+    resetPid(xVelPID,   -1, 1);
+    resetPid(yVelPID,   -1, 1);
+    resetPid(zVelPID,   -1, 1);
+  }
 
-  // 4) Periodically forward latest attitude to laptop
+  xPosPID.Compute();
+  yPosPID.Compute();
+  zPosPID.Compute();
+  yawPosPID.Compute();
+  xVelPID.Compute();
+  yVelPID.Compute();
+  zVelPID.Compute();
+
+  // PWM in raw CRSF units centred on 992 (=midstick), span ±811 (=full deflection).
+  int xPWM   = 992 + (int)(xVelOutput * 811)            + xTrim;
+  int yPWM   = 992 + (int)(yVelOutput * 811)            + yTrim;
+  int zPWM   = 992 + (int)(Z_GAIN * zVelOutput * 811)   + zTrim;
+  int yawPWM = 992 + (int)(yawPosOutput * 811)          + yawTrim;
+
+  // Ground effect attenuation on throttle near floor. Negative multiplier
+  // clamped to 0 to protect against bad altitude readings.
+  double denom = 4.0 * (zPos - groundEffectOffset);
+  double multiplier = 1.0;
+  if (fabs(denom) > 1e-6) {
+    double r = (2.0 * ROTOR_RADIUS) / denom;
+    multiplier = 1.0 - groundEffectCoef * r * r;
+  }
+  if (multiplier < 0.0) multiplier = 0.0;
+  zPWM = (int)(zPWM * multiplier);
+
+  // Arm-delay: zero throttle for the first 100 ms after arming to let motors
+  // spin up cleanly before any PID-driven climb.
+  if (!armed || (millis() - timeArmed) <= ARM_DELAY_MS) {
+    zPWM = 172;
+  }
+
+  if (failsafe) {
+    setSafeChannels();
+  } else {
+    for (int i = 0; i < 16; i++) channels[i] = 992;
+    channels[0] = pwmToCRSF(-yPWM + 1984);  // roll  (axis flipped vs y body)
+    channels[1] = pwmToCRSF(xPWM);          // pitch
+    channels[2] = pwmToCRSF(zPWM);          // throttle
+    channels[3] = pwmToCRSF(yawPWM);        // yaw
+    channels[4] = armed ? usToCRSF(2000) : usToCRSF(1000);
+  }
+
+  // 4) Send CRSF channels packed to FC at ~250 Hz.
+  if (millis() - lastCRSFSend >= 4) {
+    lastCRSFSend = millis();
+    sendCRSF();
+  }
+
+  // 5) Periodically forward latest attitude to laptop at ~50 Hz.
   if (millis() - lastTelemSend >= TELEMETRY_PERIOD_MS) {
     lastTelemSend = millis();
     telem.seq++;
     esp_now_send(senderAddress, (uint8_t *)&telem, sizeof(telem));
   }
 
-  delay(4); // ~250 Hz CRSF output cadence
+  // 6) Pace the main loop at ~500 Hz. 2 ms is the right granularity on C3
+  // and matches the spec's "delay(2)" hint without busy-spinning.
+  uint32_t now = micros();
+  uint32_t elapsed = now - lastLoopTime;
+  if (elapsed < 2000) {
+    delayMicroseconds(2000 - elapsed);
+  }
+  lastLoopTime = micros();
 }

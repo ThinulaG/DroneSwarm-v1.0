@@ -1,10 +1,17 @@
 // Mocap PC <-> drone bridge (laptop-side ESP32, USB serial <-> ESP-NOW).
 //
 // Direction PC -> drone:
-//   Reads "throttle,roll,pitch,yaw,armed\n" CSV from USB serial @ 115200,
-//   forwards as a binary ControlPacket via ESP-NOW @ 50 Hz to the drone.
+//   Reads three line-based formats from USB serial @ 115200 and forwards as
+//   a binary StatePacket (msg_type-tagged) via ESP-NOW @ 50 Hz to the drone:
 //
-// Direction drone -> PC (NEW vs your manual-control sender):
+//     "S,x,y,z,vx,vy,vz,yaw_sp,x_sp,y_sp,z_sp,armed\n"  -> msg_type 0
+//     "P,<17 floats>\n"                                  -> msg_type 2 (PID + ground effect)
+//     "T,trim_t,trim_r,trim_p,trim_y\n"                  -> msg_type 3
+//
+//   State packets are streamed at the 50 Hz periodic timer. P/T packets are
+//   sent immediately on parse (rare events).
+//
+// Direction drone -> PC:
 //   ESP-NOW receives a binary TelemetryPacket (CRSF attitude relayed by the
 //   drone ESP32-C3), and prints "H<yaw_rad>\n" over USB serial so the Python
 //   backend can fuse heading.
@@ -15,22 +22,32 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <string.h>
 
 // ================= USER SETTINGS =================
 uint8_t receiverAddress[] = { 0x10, 0x00, 0x3B, 0xB1, 0x5B, 0x8C };
 #define ESPNOW_CHANNEL 1
-#define SEND_PERIOD_MS 20   // 50 Hz from transmitter to receiver
+#define SEND_PERIOD_MS 20   // 50 Hz state stream
 #define DEBUG_CMD_PRINT 0
 // =================================================
 
+// Tagged ESP-NOW packet. msg_type selects which fields the receiver applies.
+// Fields are always sent (cheap on ESP-NOW); receiver dispatches on msg_type.
 typedef struct __attribute__((packed)) {
-  uint16_t throttle_us;
-  uint16_t roll_us;
-  uint16_t pitch_us;
-  uint16_t yaw_us;
-  uint8_t  armed;
+  float    x,  y,  z;            // world position metres
+  float    vx, vy, vz;           // world velocity m/s
+  float    yaw_sp;               // yaw setpoint radians
+  float    x_sp, y_sp, z_sp;     // position setpoints metres
+  // 17 floats for PID + ground effect (msg_type=2 only):
+  //   [0..2]  xy pos kp/ki/kd       [3..5]  z pos kp/ki/kd
+  //   [6..8]  yaw pos kp/ki/kd      [9..11] xy vel kp/ki/kd
+  //   [12..14] z vel kp/ki/kd       [15] groundEffectCoef [16] groundEffectOffset
+  float    pid[17];
+  int16_t  trim_t, trim_r, trim_p, trim_y;
+  uint8_t  armed;                // 0 or 1
+  uint8_t  msg_type;             // 0=state, 2=pid_gains, 3=trim
   uint32_t seq;
-} ControlPacket;
+} StatePacket;
 
 // MUST match the struct in drone_receiver_crsf_espnow.ino exactly.
 typedef struct __attribute__((packed)) {
@@ -40,51 +57,103 @@ typedef struct __attribute__((packed)) {
   uint32_t seq;
 } TelemetryPacket;
 
-ControlPacket cmd = {1000, 1500, 1500, 1500, 0, 0};
+StatePacket latestState = {};
 uint32_t lastSend = 0;
+uint32_t seqCounter = 0;
 String inputLine = "";
 
-uint16_t clampUS(long v) {
-  if (v < 1000) return 1000;
-  if (v > 2000) return 2000;
-  return (uint16_t)v;
-}
-
-void parseSerialCommand(String line) {
-  line.trim();
-  if (line.length() == 0) return;
-
-  long vals[5];
-  int start = 0;
-  for (int i = 0; i < 5; i++) {
+// Parse N comma-separated floats from `line` starting at offset `start`.
+// Returns true on success, false if any field is missing or non-numeric.
+static bool parseFloats(const String &line, int start, float *out, int n) {
+  for (int i = 0; i < n; i++) {
     int comma = line.indexOf(',', start);
-    String part;
-    if (comma == -1) {
-      part = line.substring(start);
-      if (i < 4) return;
-    } else {
-      part = line.substring(start, comma);
-    }
+    String part = (comma == -1) ? line.substring(start) : line.substring(start, comma);
     part.trim();
-    vals[i] = part.toInt();
+    if (part.length() == 0) return false;
+    out[i] = part.toFloat();
+    if (comma == -1 && i != n - 1) return false;
     start = comma + 1;
   }
+  return true;
+}
 
-  cmd.throttle_us = clampUS(vals[0]);
-  cmd.roll_us     = clampUS(vals[1]);
-  cmd.pitch_us    = clampUS(vals[2]);
-  cmd.yaw_us      = clampUS(vals[3]);
-  cmd.armed       = vals[4] ? 1 : 0;
-  if (!cmd.armed) cmd.throttle_us = 1000;
+static bool parseInts(const String &line, int start, long *out, int n) {
+  for (int i = 0; i < n; i++) {
+    int comma = line.indexOf(',', start);
+    String part = (comma == -1) ? line.substring(start) : line.substring(start, comma);
+    part.trim();
+    if (part.length() == 0) return false;
+    out[i] = part.toInt();
+    if (comma == -1 && i != n - 1) return false;
+    start = comma + 1;
+  }
+  return true;
+}
+
+// "S,x,y,z,vx,vy,vz,yaw_sp,x_sp,y_sp,z_sp,armed\n" -> populate latestState (msg_type=0).
+// 11 fields: 10 floats + armed (parsed as float, rounded).
+static void parseStateLine(const String &line) {
+  float f[11];
+  if (!parseFloats(line, 2, f, 11)) return;
+
+  latestState.x      = f[0];
+  latestState.y      = f[1];
+  latestState.z      = f[2];
+  latestState.vx     = f[3];
+  latestState.vy     = f[4];
+  latestState.vz     = f[5];
+  latestState.yaw_sp = f[6];
+  latestState.x_sp   = f[7];
+  latestState.y_sp   = f[8];
+  latestState.z_sp   = f[9];
+  latestState.armed  = (f[10] >= 0.5f) ? 1 : 0;
+  latestState.msg_type = 0;
 
 #if DEBUG_CMD_PRINT
-  Serial.print("CMD ");
-  Serial.print(cmd.throttle_us); Serial.print(',');
-  Serial.print(cmd.roll_us); Serial.print(',');
-  Serial.print(cmd.pitch_us); Serial.print(',');
-  Serial.print(cmd.yaw_us); Serial.print(',');
-  Serial.println(cmd.armed);
+  Serial.printf("S pos=%.3f,%.3f,%.3f vel=%.3f,%.3f,%.3f yaw_sp=%.3f sp=%.3f,%.3f,%.3f arm=%u\n",
+                latestState.x, latestState.y, latestState.z,
+                latestState.vx, latestState.vy, latestState.vz,
+                latestState.yaw_sp,
+                latestState.x_sp, latestState.y_sp, latestState.z_sp,
+                latestState.armed);
 #endif
+}
+
+// "P,<17 floats>\n" -> send PID gain update once (msg_type=2). Does not mutate state stream.
+static void parsePidLine(const String &line) {
+  float gains[17];
+  if (!parseFloats(line, 2, gains, 17)) return;
+
+  StatePacket pkt = latestState;
+  memcpy(pkt.pid, gains, sizeof(gains));
+  pkt.msg_type = 2;
+  pkt.seq = ++seqCounter;
+  esp_now_send(receiverAddress, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+// "T,trim_t,trim_r,trim_p,trim_y\n" -> send trim update once (msg_type=3).
+static void parseTrimLine(const String &line) {
+  long t[4];
+  if (!parseInts(line, 2, t, 4)) return;
+
+  StatePacket pkt = latestState;
+  pkt.trim_t = (int16_t)t[0];
+  pkt.trim_r = (int16_t)t[1];
+  pkt.trim_p = (int16_t)t[2];
+  pkt.trim_y = (int16_t)t[3];
+  pkt.msg_type = 3;
+  pkt.seq = ++seqCounter;
+  esp_now_send(receiverAddress, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+static void parseSerialLine(const String &line) {
+  if (line.length() < 2 || line[1] != ',') return;
+  switch (line[0]) {
+    case 'S': parseStateLine(line); break;
+    case 'P': parsePidLine(line);   break;
+    case 'T': parseTrimLine(line);  break;
+    default:                        break;
+  }
 }
 
 void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
@@ -134,25 +203,30 @@ void setup() {
     return;
   }
 
+  // Safe defaults until the PC sends real state.
+  latestState.armed = 0;
+  latestState.msg_type = 0;
+
   Serial.println("Transmitter ready: Python Serial -> ESP-NOW; ESP-NOW -> H<yaw>");
-  Serial.println("Format: throttle,roll,pitch,yaw,armed");
+  Serial.println("Format: S,x,y,z,vx,vy,vz,yaw_sp,x_sp,y_sp,z_sp,armed");
 }
 
 void loop() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') {
-      parseSerialCommand(inputLine);
+      parseSerialLine(inputLine);
       inputLine = "";
     } else if (c != '\r') {
       inputLine += c;
-      if (inputLine.length() > 80) inputLine = "";
+      if (inputLine.length() > 256) inputLine = "";  // guard against runaway P-lines
     }
   }
 
   if (millis() - lastSend >= SEND_PERIOD_MS) {
     lastSend = millis();
-    cmd.seq++;
-    esp_now_send(receiverAddress, (uint8_t *)&cmd, sizeof(cmd));
+    latestState.msg_type = 0;          // periodic stream is always msg_type=0
+    latestState.seq = ++seqCounter;
+    esp_now_send(receiverAddress, (uint8_t *)&latestState, sizeof(latestState));
   }
 }

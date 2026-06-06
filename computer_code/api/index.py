@@ -2,7 +2,7 @@
 Single-drone Flask + SocketIO backend.
 
 Pipeline:
-    4 USB cams ──► Tracker ──► KalmanFilter ──► Controller ──► CSV serial ──► sender ESP32 ──► drone
+    4 USB cams ──► Tracker ──► KalmanFilter ──► Controller ──► S-line serial ──► sender ESP32 ──► drone PIDs
 
 Threads:
     - Tracker worker (inside Tracker; ~30 Hz)
@@ -10,9 +10,11 @@ Threads:
     - Control (this file; ~60 Hz)
     - Flask/SocketIO main thread
 
-Serial protocol (matches existing `drone_transmitter_serial_espnow.ino`):
-    PC -> ESP : "T,R,P,Y,A\n"   ints, throttle/roll/pitch/yaw µs + armed 0/1
-    ESP -> PC : "H<yaw>\n"      float radians (added by upcoming sender patch)
+Serial protocol (sender_esp32.ino):
+    PC -> ESP : "S,x,y,z,vx,vy,vz,yaw_sp,x_sp,y_sp,z_sp,armed\n"  state stream
+                "P,<17 floats>\n"  PID + ground-effect gain update (one-shot)
+                "T,trim_t,trim_r,trim_p,trim_y\n"  trim update (one-shot)
+    ESP -> PC : "H<yaw>\n"      float radians (heading bridge)
 
 Environment:
     SENDER_SERIAL_PORT   default 'COM5' on Windows
@@ -81,7 +83,7 @@ _heading_lpf = LowPassFilter(
 _state_lock = threading.Lock()
 _emit_state = {
     "pos": None, "vel": None, "heading": None, "heading_age": None,
-    "sticks": None, "state": "IDLE", "fps": 0.0,
+    "setpoint": None, "armed": 0, "state": "IDLE", "fps": 0.0,
 }
 
 
@@ -102,13 +104,12 @@ def _open_serial():
     return _ser
 
 
-def _serial_write_csv(t, r, p, y, a):
-    if _ser is None or not _ser.is_open:
+def _serial_write(payload: bytes):
+    if _ser is None or not _ser.is_open or not payload:
         return
-    line = f"{int(t)},{int(r)},{int(p)},{int(y)},{int(a)}\n".encode()
     try:
         with _ser_lock:
-            _ser.write(line)
+            _ser.write(payload)
     except Exception as e:
         print(f"[serial] write failed: {e}")
 
@@ -189,17 +190,23 @@ def _control_loop():
             # but do not permit actual closed-loop flight without a pose.
             ctrl_state = controller.get_state()
             if ctrl_state in ("TAKEOFF", "HOVER", "LANDING"):
-                T, R, P, Y, A = 1000, 1500, 1500, 1500, 0
+                pkt = {
+                    "x": 0.0, "y": 0.0, "z": 0.0,
+                    "vx": 0.0, "vy": 0.0, "vz": 0.0,
+                    "yaw_sp": 0.0,
+                    "x_sp": 0.0, "y_sp": 0.0, "z_sp": 0.0,
+                    "armed": 0, "state": ctrl_state,
+                }
             else:
                 zero = np.zeros(3, dtype=np.float32)
-                T, R, P, Y, A = controller.step(zero, zero, heading, dt)
-                ctrl_state = controller.get_state()
+                pkt = controller.step(zero, zero, heading, dt)
+                ctrl_state = pkt["state"]
         else:
-            T, R, P, Y, A = controller.step(pos, vel, heading, dt)
-            ctrl_state = controller.get_state()
+            pkt = controller.step(pos, vel, heading, dt)
+            ctrl_state = pkt["state"]
 
         # ---- Serial out ----
-        _serial_write_csv(T, R, P, Y, A)
+        _serial_write(Controller.serialize_state(pkt))
 
         # ---- Stash for emitter ----
         if now >= next_emit_t:
@@ -209,7 +216,8 @@ def _control_loop():
                 _emit_state["vel"] = None if vel is None else [float(x) for x in vel]
                 _emit_state["heading"] = heading
                 _emit_state["heading_age"] = (now - heading_t) if heading_t else None
-                _emit_state["sticks"] = [T, R, P, Y, A]
+                _emit_state["setpoint"] = [pkt["x_sp"], pkt["y_sp"], pkt["z_sp"]]
+                _emit_state["armed"] = pkt["armed"]
                 _emit_state["state"] = ctrl_state
                 _emit_state["fps"] = cameras.fps()
                 _emit_state["tracker_fresh"] = tracker_fresh
@@ -307,8 +315,12 @@ def on_land(_data):
 
 @socketio.on("set-drone-pid")
 def on_set_pid(data):
-    if isinstance(data, dict) and "dronePID" in data:
-        controller.set_pid(data["dronePID"])
+    if not (isinstance(data, dict) and "dronePID" in data):
+        return
+    gains = data["dronePID"]
+    if not isinstance(gains, (list, tuple)) or len(gains) < 15:
+        return
+    _serial_write(Controller.serialize_pid(gains))
 
 
 @socketio.on("set-drone-setpoint")
@@ -324,13 +336,15 @@ def on_set_setpoint(data):
 
 @socketio.on("set-drone-trim")
 def on_set_trim(data):
-    if isinstance(data, dict) and "droneTrim" in data:
-        tr = data["droneTrim"]
-        if isinstance(tr, list) and len(tr) >= 4:
-            try:
-                controller.set_trim(int(tr[0]), int(tr[1]), int(tr[2]), int(tr[3]))
-            except (ValueError, TypeError):
-                pass
+    if not (isinstance(data, dict) and "droneTrim" in data):
+        return
+    tr = data["droneTrim"]
+    if not (isinstance(tr, list) and len(tr) >= 4):
+        return
+    try:
+        _serial_write(Controller.serialize_trim(int(tr[0]), int(tr[1]), int(tr[2]), int(tr[3])))
+    except (ValueError, TypeError):
+        pass
 
 
 @socketio.on("update-camera-settings")
