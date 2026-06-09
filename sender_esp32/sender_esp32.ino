@@ -106,7 +106,11 @@ static void parseStateLine(const String &line) {
   latestState.x_sp   = f[7];
   latestState.y_sp   = f[8];
   latestState.z_sp   = f[9];
-  latestState.armed  = (f[10] >= 0.5f) ? 1 : 0;
+  // armed is a tristate: 0=disarmed, 1=motors armed but parked, 2=flying.
+  int armv = (int)(f[10] + 0.5f);
+  if (armv < 0) armv = 0;
+  if (armv > 2) armv = 2;
+  latestState.armed = (uint8_t)armv;
   latestState.msg_type = 0;
 
 #if DEBUG_CMD_PRINT

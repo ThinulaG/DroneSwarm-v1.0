@@ -31,6 +31,7 @@
 #define TELEMETRY_PERIOD_MS 20   // 50 Hz drone -> laptop attitude updates
 #define DEBUG_RX_PRINT 0
 #define ENABLE_YAW_HOLD 0
+#define ENABLE_GROUND_EFFECT 0   // see note in loop() near the multiplier
 
 #define MAX_VEL 100.0
 #define ROTOR_RADIUS 0.0225
@@ -73,7 +74,8 @@ uint16_t channels[16];
 
 // ---------------- PID state ----------------
 
-bool armed = false;
+bool armed  = false;   // motors energised (FC arm switch high)
+bool flying = false;   // armed AND z PID is allowed to drive throttle
 unsigned long timeArmed = 0;
 
 int xTrim = 0, yTrim = 0, zTrim = 0, yawTrim = 0;
@@ -249,11 +251,14 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int 
     yPosSetpoint = pkt.y_sp;
     zPosSetpoint = pkt.z_sp;
 
-    bool newArmed = pkt.armed ? true : false;
+    // pkt.armed: 0=disarmed, 1=motors armed but parked, 2=armed & flying.
+    bool newArmed  = (pkt.armed != 0);
+    bool newFlying = (pkt.armed == 2);
     if (newArmed && !armed) {
       timeArmed = millis();
     }
-    armed = newArmed;
+    armed  = newArmed;
+    flying = newFlying;
 
   } else if (pkt.msg_type == 2) {
     xPosPID.SetTunings(pkt.pid[0], pkt.pid[1], pkt.pid[2]);
@@ -345,12 +350,14 @@ void loop() {
   // 2) Failsafe if PC comm died -- disarm and force safe sticks.
   bool failsafe = (millis() - lastRecvTime > FAILSAFE_MS);
   if (failsafe) {
-    armed = false;
+    armed  = false;
+    flying = false;
   }
 
   // 3) PID loop runs every loop iteration (~500 Hz pacing below).
-  if (!armed) {
-    // Park integrators so we don't pop on rearm.
+  // Park ALL integrators whenever we're not actively flying so that the
+  // transition into TAKEOFF starts from a clean slate.
+  if (!flying) {
     resetPid(xPosPID,   -MAX_VEL, MAX_VEL);
     resetPid(yPosPID,   -MAX_VEL, MAX_VEL);
     resetPid(zPosPID,   -MAX_VEL, MAX_VEL);
@@ -379,8 +386,12 @@ void loop() {
   int zPWM   = 992 + (int)(Z_GAIN * zVelOutput * 811)   + zTrim;
   int yawPWM = 992 + (int)(yawPosOutput * 811)          + yawTrim;
 
-  // Ground effect attenuation on throttle near floor. Negative multiplier
-  // clamped to 0 to protect against bad altitude readings.
+#if ENABLE_GROUND_EFFECT
+  // Ground effect attenuation on throttle near floor. NOTE: with the default
+  // coefficient of 28, this formula goes negative (and clamps to 0) for
+  // zPos < ~0.025 m -- it will zero out throttle while the drone is on the
+  // ground and prevent takeoff. Only enable this once the drone is reliably
+  // airborne and you actually want low-altitude bob compensation.
   double denom = 4.0 * (zPos - groundEffectOffset);
   double multiplier = 1.0;
   if (fabs(denom) > 1e-6) {
@@ -389,10 +400,13 @@ void loop() {
   }
   if (multiplier < 0.0) multiplier = 0.0;
   zPWM = (int)(zPWM * multiplier);
+#endif
 
-  // Arm-delay: zero throttle for the first 100 ms after arming to let motors
-  // spin up cleanly before any PID-driven climb.
-  if (!armed || (millis() - timeArmed) <= ARM_DELAY_MS) {
+  // Throttle gate: hard-park throttle at minimum unless we're in the FLYING
+  // sub-state (TAKEOFF / HOVER / LANDING on the PC side). This prevents the
+  // drone from lifting on arm-only commands. The 100 ms arm-delay is still
+  // honoured even after entering FLYING so motors have time to spin up.
+  if (!armed || !flying || (millis() - timeArmed) <= ARM_DELAY_MS) {
     zPWM = 172;
   }
 

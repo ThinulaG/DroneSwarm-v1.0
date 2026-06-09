@@ -84,6 +84,13 @@ class Controller:
         self._state_entry_t = time.perf_counter()
         self._takeoff_target_z = 0.20
 
+        # Endpoints of the z-ramp, latched on entry into TAKEOFF / LANDING.
+        # This keeps the ramp continuous with the drone's actual altitude.
+        self._takeoff_start_z = 0.0
+        self._takeoff_z_latched = False
+        self._landing_start_z = 0.0
+        self._landing_z_latched = False
+
         # Latched setpoint (xy + heading captured at TAKEOFF entry; z ramped)
         self._sp = _Setpoint()
 
@@ -157,13 +164,16 @@ class Controller:
             return self._packet_safe(pos=pos)
 
         if self.state == State.ARMING or self.state == State.READY:
-            # Armed, but setpoint = current position so the drone holds station.
+            # Motors armed (FC arm switch HIGH) but PARKED -- throttle stays at
+            # minimum on the drone side. Setpoint = current position so the
+            # outer PIDs don't wind up.
             return self._packet(pos, vel, heading, armed=1,
                                 sp_x=float(pos[0]), sp_y=float(pos[1]), sp_z=0.0)
 
         # TAKEOFF / HOVER / LANDING all stream the active latched setpoint
-        # (with ramped z) to the drone-side PIDs.
-        return self._packet(pos, vel, heading, armed=1,
+        # (with ramped z) to the drone-side PIDs. armed=2 unlocks the z PID
+        # output -- the drone will actually fly.
+        return self._packet(pos, vel, heading, armed=2,
                             sp_x=self._sp.x, sp_y=self._sp.y, sp_z=self._sp.z)
 
     # ----------------------------------------------------------------
@@ -176,6 +186,10 @@ class Controller:
         self.state = new_state
         self._state_entry_t = time.perf_counter()
         self._z_err_violation_since = None
+        if new_state == State.TAKEOFF:
+            self._takeoff_z_latched = False    # latch fresh pos on first tick
+        if new_state == State.LANDING:
+            self._landing_z_latched = False
 
     def _state_age(self) -> float:
         return time.perf_counter() - self._state_entry_t
@@ -214,21 +228,30 @@ class Controller:
             self._go(State.READY)
             return
 
-        # TAKEOFF z ramp (xy latched, z ramps 0 -> target over takeoff_ramp_s)
+        # TAKEOFF z ramp: starts at the drone's CURRENT altitude (latched on
+        # first tick) so the setpoint never lies below the drone -- otherwise
+        # the z PID would briefly command a descent right after takeoff.
         if self.state == State.TAKEOFF:
+            if not self._takeoff_z_latched:
+                self._takeoff_start_z = float(pos[2])
+                self._takeoff_z_latched = True
             a = self._state_age()
             frac = min(1.0, a / max(self.p.takeoff_ramp_s, 1e-3))
-            self._sp.z = frac * self._takeoff_target_z
+            self._sp.z = self._takeoff_start_z + frac * (self._takeoff_target_z - self._takeoff_start_z)
             if frac >= 1.0:
                 self._sp.z = self._takeoff_target_z
                 self._go(State.HOVER)
             return
 
-        # LANDING z ramp (xy held, z ramps current -> 0 over landing_ramp_s)
+        # LANDING z ramp: starts at the drone's CURRENT altitude (latched on
+        # first tick) and goes to 0 over landing_ramp_s.
         if self.state == State.LANDING:
+            if not self._landing_z_latched:
+                self._landing_start_z = float(pos[2])
+                self._landing_z_latched = True
             a = self._state_age()
             frac = min(1.0, a / max(self.p.landing_ramp_s, 1e-3))
-            self._sp.z = self._takeoff_target_z * (1.0 - frac)
+            self._sp.z = self._landing_start_z * (1.0 - frac)
             if frac >= 1.0:
                 self._sp.z = 0.0
                 self._armed_requested = False  # cut motors at touchdown
