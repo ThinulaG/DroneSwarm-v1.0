@@ -30,6 +30,7 @@
 #define FAILSAFE_MS 500
 #define TELEMETRY_PERIOD_MS 20   // 50 Hz drone -> laptop attitude updates
 #define DEBUG_RX_PRINT 0
+#define ENABLE_YAW_HOLD 0
 
 #define MAX_VEL 100.0
 #define ROTOR_RADIUS 0.0225
@@ -224,6 +225,7 @@ void parseCRSFByte(uint8_t b) {
           telem.pitch_centirad = pitch_cr;
           telem.roll_centirad  = roll_cr;
           telem.yaw_centirad   = yaw_cr;
+          yawPos = (double)yaw_cr / 10000.0;
         }
         crsfState = CRSF_WAIT_SYNC;
       }
@@ -361,7 +363,12 @@ void loop() {
   xPosPID.Compute();
   yPosPID.Compute();
   zPosPID.Compute();
-  yawPosPID.Compute();
+  if (ENABLE_YAW_HOLD) {
+    yawPosPID.Compute();
+  } else {
+    resetPid(yawPosPID, -1, 1);
+    yawPosOutput = 0.0;
+  }
   xVelPID.Compute();
   yVelPID.Compute();
   zVelPID.Compute();
