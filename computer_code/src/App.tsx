@@ -201,7 +201,7 @@ export default function App() {
                   <CameraWireframe key={i} R={p.R} t={p.t} />
                 ))}
                 {droneState.pos && (
-                  <mesh position={[droneState.pos[0], droneState.pos[2], droneState.pos[1]]}>
+                  <mesh position={[droneState.pos[0], droneState.pos[2], -droneState.pos[1]]}>
                     <sphereGeometry args={[0.015, 12, 12]} />
                     <meshStandardMaterial color="red" />
                   </mesh>

@@ -4,7 +4,9 @@
 //   R = camera-axes-in-world (3x3, orthonormal, OpenCV convention: +z forward,
 //                              +x right, +y down)
 //   t = camera center in world, metres
-// We render in three.js Y-up by swapping (wx, wy, wz) -> (wx, wz, wy).
+// We render in three.js Y-up via a -90° rotation about X:
+// (wx, wy, wz) -> (wx, wz, -wy). A bare Y/Z swap flips handedness and
+// visually mirrors the Y axis.
 
 import { BufferAttribute, BufferGeometry, EdgesGeometry, LineBasicMaterial } from "three";
 
@@ -29,8 +31,8 @@ export default function CameraWireframe({ R, t }: { R: number[][], t: number[] }
       const wx = R[0][0] * sx + R[0][1] * sy + R[0][2] * sz + t[0];
       const wy = R[1][0] * sx + R[1][1] * sy + R[1][2] * sz + t[1];
       const wz = R[2][0] * sx + R[2][1] * sy + R[2][2] * sz + t[2];
-      // three.js: Y is up; world has Z up.
-      return [wx, wz, wy];
+      // three.js: Y is up; world has Z up. Rotate -90° about X.
+      return [wx, wz, -wy];
     })
   );
 
